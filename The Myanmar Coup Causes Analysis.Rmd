@@ -1,0 +1,750 @@
+---
+title: "Final Report"
+author: "Yachen Guo"
+date: '2021-12-08'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+---
+
+```{r, message=F, warning=F}
+# knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(modelsummary)
+library(tidyverse)
+```
+![](https://gdb.voanews.com/3D69BE52-FD33-4744-A44C-6B723FC53F34_w650_r1_s.jpg)
+
+## ABSTRACT
+This project is an analysis of The Myanmar coup of 2021. The main focus is on the economic and social characteristics of the area (township level) where the people were arrested and died in the coup. We select the characteristic variables through exploratory descriptive statistics and perform statistics by means of hypothesis testing and regression analysis. We draw the conclusion that the number of detainees is significantly related to the employment status of their area, the food poverty index, the literacy rate, and the total number of conflicts in the past period. As a result of the above analysis, we believe that it is feasible to improve the local economic situation as a starting point in order to stabilize the situation in Burma.     
+
+
+## INTRODUCTION
+
+In early February 2021, there was an army mutiny in Burma. This mutiny had a 
+huge impact, with many citizens and opposition forces being detained, imprisoned
+and even killed. We hope that we can draw some useful conclusions by exploring 
+the characteristics of these affected individuals themselves and the areas where
+they were located.
+
+In our study the main focus of: Dependent Variable: **Detainees per 1000**  
+ Independent Variable: **Economy** (*Poverty Ratio*, *Food Poverty Ratio*, *Poverty Gap*);
+ **Sex**; **Employment** (*Employee Number*); **Education**  
+ (*Female*, *Male*, *Total*).
+
+We hope that through our analysis, we can give the Burmese authorities or 
+international organizations concerned about the situation in Burma some insights 
+related to ameliorating the chaos and promoting stability in Burma.
+
+## METHODS
+- Data preprocessing
+- Descriptive statistical analysis  
+- Exploratory statistics  
+- Hypothesis testing (mainly t-tests)  
+- Linear regression (including simple linear regression and multiple linear regression) 
+
+### Data Preprocessing
+#### Data loading and cleaning
+Get the main dataset of detainees, imprisoned, fallen.
+Clean the dataset as needed.
+```{r, message=F, warning=F}
+# Import starting data (AAPP)
+detainees = read_csv("https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/detained.csv.gz")
+imprisoned = read_csv("https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/imprisoned.csv.gz")
+fallen = read_csv("https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/fallen.csv")
+
+# edit the township values in the detainees dataset
+detainees <- detainees %>%
+  mutate(Township = str_replace_all(Address, ".*,", "")) %>%
+  mutate(Township = str_replace_all(Township, "T?own.*", ""))
+
+# delete the null/non-functional values of age in the fallen dataset for future use
+fallen <- fallen %>%
+  # convert Age to the numeric type
+  mutate(Age = as.numeric(Age)) %>%
+  # delete the rows with null Age
+  filter(!is.na(.$Age)) %>%
+  # delete the rows with abnormal `States/Regions`
+  filter(nchar(.$`States/Regions`) < 15) %>%
+  mutate(`States/Regions` = str_replace_all(`States/Regions`, " ", ""))
+```
+
+Read the conflicts (ACLED) data.
+```{r, message=F, warning=F}
+conflicts = read_csv("https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/conflicts.csv.gz")
+```
+
+Read the sector indicators (MIMU) data.
+```{r, message=F, warning=F}
+# sectors (MIMU)
+tmp = tempfile(fileext = ".xlsm")
+httr::GET(
+  url = "https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/MIMU_BaselineData_AllSectors_Countrywide_18Mar2021_revised.xlsm", 
+  httr::write_disk(tmp)
+)
+
+# Township level of MIMU data
+sector.indicators = 
+  readxl::read_xlsx(tmp, sheet=3, skip = 5) %>% as_tibble()
+
+# Organize all sectors data to be given by nested tibbles per indicator
+sector.nest = sector.indicators %>% 
+  select(1:3, 
+         Indicator_Name, Indicator_Type, Sector, Unit, 
+         starts_with("20"), Source_Name) %>%
+  mutate(Indicator = paste(Indicator_Name, Indicator_Type, 
+                           Sector, Unit, Source_Name, sep="|")) %>%
+  select(1:3, Indicator, starts_with("20")) %>%
+  pivot_longer(cols = starts_with("20"), 
+               names_to = "Year", 
+               values_to="Value") %>%
+  filter(!is.na(Value)) %>%
+  nest(data = -Indicator) %>%
+  separate(Indicator, sep="\\|", 
+           into = c("Indicator_Name", "Indicator_Type",
+                    "Sector","Unit","Source_Name")) 
+
+# State_Region level of MIMU data
+sector.indicators.state.level = 
+  readxl::read_xlsx(tmp, sheet=2, skip = 5) %>% as_tibble()
+
+# Organize all sectors data to be given by nested tibbles per indicator
+sector.state.level.nest = sector.indicators.state.level %>% 
+  select(1:3, 
+         Indicator_Name, Indicator_Type, Sector, Unit, 
+         starts_with("20"), Source_Name) %>%
+  mutate(Indicator = paste(Indicator_Name, Indicator_Type, 
+                           Sector, Unit, Source_Name, sep="|")) %>%
+  select(1:3, Indicator, starts_with("20")) %>%
+  pivot_longer(cols = starts_with("20"), 
+               names_to = "Year", 
+               values_to="Value") %>%
+  filter(!is.na(Value)) %>%
+  nest(data = -Indicator) %>%
+  separate(Indicator, sep="\\|", 
+           into = c("Indicator_Name", "Indicator_Type",
+                    "Sector","Unit","Source_Name")) 
+```
+
+```{r}
+# We can use the Levenshtein distance to find approximate matches at the township level.
+
+#' level computes the levenshtein distance between x and each y and returns
+#' the ones that are within k of the smallest value as an ordered vector. 
+#' See ?adist for details.
+#' @return data.frame of hits
+leven = function(x, y, k=0, ignore.case=T) {
+  data.frame(y=y) %>%
+    as_tibble() %>%
+    
+    # compute Levenshtein distance for string x for each y
+    mutate(distance = utils::adist(x, y, 
+                                   ignore.case=ignore.case) %>% .[1,]) %>%
+    
+    # keep y's within k of the best match
+    filter(distance <= min(distance, na.rm=T) + k) %>%
+    mutate(distance.per.char = distance/nchar(y))
+}
+
+# Use `leven` for string *vectors* `x` and `y`
+apply_leven = function(x, y, k=0, distance.threshold=0.3, ignore.case=F) {
+  data.frame(x=x) %>%
+    # get potential matches for each x as a list of tibbles
+    mutate(leven.df = map(x, ~ leven(.x, y=y,
+                                     k=k, ignore.case=ignore.case))
+    ) %>%
+    unnest(everything()) %>%
+    mutate(is.match=distance.per.char < distance.threshold) %>%
+    
+    # order by best match
+    arrange(distance.per.char) %>%
+    
+    # keep the best match per `x`
+    group_by(x) %>% 
+    slice(1) %>%  
+    ungroup() %>%
+    
+    # convert non-matches to Other
+    mutate(y = ifelse(is.match, y, "Other"))  
+}
+
+```
+
+#### Data merging
+Merge data and calculate the number of detainees per 1000
+```{r, message=F, warning=F}
+township.sizes = sector.nest %>% 
+  filter(Indicator_Name=="Population size", 
+         Indicator_Type=="Total", 
+         str_detect(Source_Name, "Census")) %>%
+  unnest(everything())
+
+# y (regression)
+detainees.per.1000 <- detainees %>% 
+  # part (c): nesting
+  nest(data=-Township) %>%
+  # part (d): merging with the detainee_township, MIMU_township mapper
+  inner_join(apply_leven(.$Township,
+                         township.sizes$Township_Name,
+                         distance.threshold=0.28),
+             by=c("Township"="x")
+  ) %>%
+  rename(detainee_township=Township, MIMU_township=y) %>%
+  # part (e): summarise at MIMU_township level
+  group_by(MIMU_township) %>%
+  summarise(detainees = sum(map_dbl(data,nrow))) %>%
+  ungroup() %>%
+  # part (f): attach MIMU indicator and compute outcome "detainees.per.1000"
+  left_join(township.sizes, by=c("MIMU_township"="Township_Name")) %>%
+  mutate(detainees.per.1000 = detainees/Value) %>%
+  arrange(desc(detainees)) %>%
+  select(MIMU_township, detainees, detainees.per.1000)
+
+```
+
+
+In the conflicts (ACLED) dataset, total number of conflicts per township
+```{r}
+conflicts.num.by.township <- conflicts %>%
+  group_by(admin3) %>%
+  count() %>%
+  mutate(conflicts.num = n) %>%
+  select(admin3, conflicts.num) %>%
+  rename(Township_Name = admin3)
+
+conflicts.num.by.township %>% head(5)
+```
+
+
+#### Data preprocessing on MIMU
+
+In the township level, extract the total employee number per town
+```{r}
+sector.employee <- sector.indicators %>%
+  filter(Indicator_Type=="Employer - Total")
+sector.employee %>% head(5)
+nrow(sector.employee[is.na(sector.employee$`2014`),])
+```
+
+For the employment data, there is no missing on the column of "2014", so we use the data on employee of 2014 for analysis use.
+
+In the township level, extract the education and sex data
+```{r}
+literacy.df = subset(sector.indicators,Indicator_Name == "Adult literacy rate" & (Indicator_Type == "Total" | Indicator_Type == "Female" | Indicator_Type == "Male")) %>%
+  select(State_Region,Township_Name,Indicator_Type,"2014")
+
+
+literacy.df.fem <- subset(literacy.df,Indicator_Type == "Female")
+literacy.df.male <- subset(literacy.df,Indicator_Type == "Male")
+literacy.df.total <- subset(literacy.df,Indicator_Type == "Total")
+
+liter.sex.merged <- merge(literacy.df.fem,literacy.df.male,by=c("Township_Name","State_Region"))
+literacy.merged <- merge(liter.sex.merged,literacy.df.total,by=c("Township_Name","State_Region"))
+literacy.merged <- literacy.merged %>%
+  rename(fem.literacy = "2014.x", male.literacy = "2014.y", total.literacy = "2014") %>%
+  select(State_Region,Township_Name,fem.literacy,male.literacy,total.literacy)
+
+literacy.merged %>% head(5)
+
+sex.ratio.df = subset(sector.indicators,Indicator_Name == "Sex ratio" & Source_Name == "MMR_MOIP/DOP, The 2014 Myanmar Population and Housing Census") %>%
+  select(State_Region,Township_Name,Indicator_Type,"2014")
+sex.ratio.df %>% head(5)
+```
+
+
+In the state level, extract the income inequality value:
+  - "Poverty headcount ratio"
+  - "Food poverty headcount index"
+  - "Poverty gap ratio"
+  
+```{r}
+# "Poverty headcount ratio"
+sector.income.poverty.ratio <- sector.indicators.state.level %>%
+  filter(Indicator_Name == "Poverty headcount ratio" & Indicator_Type == "Total")
+sector.income.poverty.ratio %>% head(5)
+nrow(sector.income.poverty.ratio[is.na(sector.income.poverty.ratio$`2010`),])
+
+# "Food poverty headcount index"
+sector.income.food.poverty.index <- sector.indicators.state.level %>%
+  filter(Indicator_Name == "Food poverty headcount index" & Indicator_Type == "Total")
+sector.income.food.poverty.index %>% head(5)
+nrow(sector.income.food.poverty.index[is.na(sector.income.food.poverty.index$`2010`),])
+
+# "Poverty gap ratio"
+sector.income.poverty.gap.ratio <- sector.indicators.state.level %>%
+  filter(Indicator_Name == "Poverty gap ratio" & Indicator_Type == "Total")
+sector.income.poverty.gap.ratio %>% head(5)
+
+nrow(sector.income.poverty.gap.ratio[is.na(sector.income.poverty.gap.ratio$`2010`),])
+```
+For the income data, there is no missing on the column of "2010", so we use the data on income of 2010 for analysis use.
+
+
+#### Merge all the data into 1 tibble
+```{r}
+sector.employee %>% arrange(Township_Name)
+detainees.per.1000 %>% arrange(MIMU_township)
+
+# merge detainees.per.1000 and sector.employee to detainees.employee
+detainees.employee <- detainees.per.1000 %>%
+  left_join(sector.employee, by=c("MIMU_township"="Township_Name")) %>%
+  select("MIMU_township","detainees.per.1000","detainees","State_Region","2014") %>%
+  filter(MIMU_township!="Other") %>%
+  rename("employee.num"="2014")
+# detainees.employee %>% head(5)
+
+
+# merge detainees.employee and sector.income.poverty.ratio to detainees.employee.income
+detainees.employee.income <- detainees.employee %>%
+  left_join(sector.income.poverty.ratio, by=c("State_Region"="State_Region")) %>%
+  select("MIMU_township", "State_Region", "detainees.per.1000", "detainees", "employee.num", "2010") %>%
+  # na.omit() %>%
+  rename("poverty.ratio"="2010")
+
+detainees.employee.income <- detainees.employee.income %>%
+  left_join(sector.income.food.poverty.index, by=c("State_Region"="State_Region")) %>%
+  select("MIMU_township", "State_Region", "detainees.per.1000", "detainees", "employee.num", "poverty.ratio", "2010") %>%
+  # na.omit() %>%
+  rename("food.poverty.index"="2010")
+
+detainees.employee.income <- detainees.employee.income %>%
+  left_join(sector.income.poverty.gap.ratio, by=c("State_Region"="State_Region")) %>%
+  select("MIMU_township", "State_Region", "detainees.per.1000", "detainees", "employee.num", "poverty.ratio", "food.poverty.index", "2010") %>%
+  # delete the na data, 2 examples in the state `Nay Pyi Taw`
+  na.omit() %>%
+  rename("poverty.gap.ratio"="2010")
+
+# detainees.employee.income %>% head(5)
+
+# merge detainees.employee.income and literacy.merged to detainees.employee.income.education
+detainees.employee.income.education <- detainees.employee.income %>%
+  left_join(literacy.merged, by=c("MIMU_township"="Township_Name","State_Region"="State_Region")) %>%
+  select("MIMU_township", "State_Region", "detainees.per.1000", "detainees", "employee.num", "poverty.ratio", "food.poverty.index", "poverty.gap.ratio", "fem.literacy", "male.literacy", "total.literacy")
+
+# merge detainees.employee.income.education and sex.ratio.df to detainees.employee.income.education.sex
+detainees.employee.income.education.sex <- detainees.employee.income.education %>%
+  left_join(sex.ratio.df, by=c("MIMU_township"="Township_Name","State_Region"="State_Region")) %>%
+  select("MIMU_township", "State_Region", "detainees.per.1000", "detainees", "employee.num", "poverty.ratio", "food.poverty.index", "poverty.gap.ratio", "fem.literacy", "male.literacy", "total.literacy","2014") %>%
+  na.omit() %>%
+  rename("sex.ratio"="2014")
+
+# detainees.employee.income.education.sex %>% head(5)
+
+# merge detainees.employee.income.education.sex and conflicts.num.by.township to merged.for.regression
+merged.for.regression <- unique(detainees.employee.income.education.sex) %>%
+  left_join(conflicts.num.by.township, by=c("MIMU_township"="Township_Name"))
+
+merged.for.regression <- merged.for.regression %>%
+  arrange(.,MIMU_township) 
+
+merged.for.regression = merged.for.regression[-c(81,84),]
+
+merged.for.regression
+```
+
+### Data Summarizations 
+#### data summarizations on Detainees dataset and other variables
+```{r}
+summary(detainees)
+str(detainees)
+detainees.employee %>%
+  datasummary_skim()
+summary(detainees.employee)
+str(detainees.employee)
+```
+
+#### Data summarizations on the fallen and imprisoned dataset
+```{r}
+summary(fallen)
+str(fallen)
+fallen %>%
+  datasummary_skim()
+fallen %>% head(5)
+``` 
+```{r}
+summary(imprisoned)
+str(imprisoned)
+imprisoned %>%
+  datasummary_skim()
+imprisoned %>% head(5)
+``` 
+
+
+### Further Research: table and figure visualizations
+We would like to research the relationship between some sector indicators, the conflicts numbers and the number of detainees in the township level.
+
+First, we plot the dependent variable for analysis.
+
+#### Table and visualizations on dependent variable
+```{r fig.align='center'}
+summary(detainees.employee.income.education.sex$detainees.per.1000)
+plot(detainees.employee.income.education.sex$detainees.per.1000,xlab="detainee per 1000")
+plot(log(detainees.employee.income.education.sex$detainees.per.1000),xlab="detainee per 1000, adjusted by log")
+```
+
+<font color="#157515">
+ The detainee per 1000 is mainly concentrated below 1, the absolute number is small, and the gap between towns is more obvious after taking the log, showing a certain trend, which needs to be dismantled by the regression analysis afterwards.
+</font>
+
+#### Table and visualizations on univariate
+```{r fig.align='center'}
+employee.num <- detainees.employee$employee.num
+summary(employee.num)
+plot(employee.num)+abline(a=10000,b=0)
+employ.percent <-detainees.employee %>%
+  mutate(num_gt_10k = case_when(employee.num>10000~1,
+                                employee.num<=10000~0))
+```
+
+<font color="#157515">
+ The scatter plot shows that the majority of towns still employ less than 10,000 people and have a relatively limited level of economic development. The percent
+of having employee number > 10,000 is `r round(sum(employ.percent$num_gt_10k)/nrow(employ.percent)*100,2)`%
+</font>
+
+```{r fig.align='center'}
+literacy_quantiles = merged.for.regression$total.literacy %>% quantile(seq(0,1,0.1))
+merged.for.regression <- mutate(merged.for.regression,literacy_bin = cut(total.literacy, literacy_quantiles, include.lowest=T))
+merged.for.regression %>%
+  count(literacy_bin)
+plot(merged.for.regression$total.literacy) + abline(a=90,b=0)
+literacy.percent <-merged.for.regression %>%
+  mutate(num_gt_90 = case_when(total.literacy>90~1,
+                                total.literacy<=90~0))
+plot(merged.for.regression$literacy_bin) 
+```
+
+<font color="#157515">
+ High literacy rate overall.The percent of having literacy rate > 90% is `r round(sum(literacy.percent$num_gt_90)/nrow(literacy.percent)*100,2)`%
+</font>
+
+
+```{r}
+sex.ratio.detainees <- merged.for.regression %>%
+  mutate(sex_cate = case_when(sex.ratio <=100 ~"More Female",
+                              sex.ratio > 100 ~"More Male")) 
+
+ratio.new <- sex.ratio.detainees %>%
+  group_by(sex_cate) %>%
+  summarise(mean_detainees=mean(detainees.per.1000))
+ratio.new
+
+```
+<font color="#157515">
+ On average, the township with more women, which is defined as sex.ratio > 100 will turns to have `r ratio.new[1,2]-ratio.new[2,2]` more detainees.ratio.1000, it may comes from woman turns to support Aung San Suu Kyi more in political campaigns.`
+</font>
+
+Next, we plot to learn the relationship between an important variable `employee.num` and `detainees.per.1000`
+
+#### Table and visualizations on bivariate - employment and detainees.
+```{r fig.align='center'}
+qplot(data = detainees.employee, x = employee.num, y = detainees.per.1000) + stat_smooth(method = "lm")
+```
+
+<font color="#157515">
+ The correlation between the number of employees and the number of detainees.per.1000 
+is low, the corr coefficient is `r detainees.employee %>% summarise(corr = cor(employee.num, detainees))`, overall the more employees in the area, the lower the number of arrests per 1,000 people.
+</font>
+
+
+
+#### Table and visualizations on bivariate - education and detainees.
+```{r fig.align='center'}
+merged.for.regression %>%
+  #group_by(MIMU_township) %>%
+  summarise(corr = cor(total.literacy, detainees))
+
+qplot(data = merged.for.regression, x = total.literacy, y = detainees.per.1000) + stat_smooth(method = "lm")
+
+base.plot <- ggplot(sex.ratio.detainees,aes(x=sex_cate,y=detainees.per.1000))
+base.plot+geom_violin()
+
+```
+
+
+<font color="#157515">
+ For the more female areas, the vast majority of towns have lower numbers of 
+arrests per 1,000 and lower concentrations overall, but also receive extreme values.
+</font>
+
+
+#### Table and visualizations on trivariate and multivariate
+```{r fig.align='center'}
+
+qplot(data = detainees.employee.income, x = poverty.ratio, y = detainees.per.1000, colour = employee.num) + stat_smooth(method = "lm")
+
+```
+
+<font color="#157515">
+ From the figure above, we found the positive correlation between the poverty ratio and the number of detainees.
+</font>
+
+```{r fig.align='center'}
+literacy.cate.base <- sex.ratio.detainees %>%
+  mutate(literacy.cate= case_when(total.literacy >=mean(total.literacy) ~"Higher Literacy",
+                              total.literacy < mean(total.literacy) ~"Lower Literacy"))
+
+p.dt.sex.literacy <- ggplot(data=literacy.cate.base,aes(y=detainees.per.1000,x=literacy.cate,fill=sex_cate))
+
+sex.literacy.colors <- c("#009E73", "#999999")
+p.dt.sex.literacy + geom_bar(stat = "identity", position = "dodge") +
+  ylab("Detainees.per.1000") + 
+  xlab("Township's literacy category") +
+  guides(fill = guide_legend(title = "Sex category status")) + 
+  scale_fill_manual(values=sex.literacy.colors)
+
+base.plot <- ggplot(data=literacy.cate.base,aes(y=detainees.per.1000,x=employee.num,color=sex_cate))
+base.plot+geom_point()+facet_wrap(~literacy.cate)+ stat_smooth(method = "lm")
+```
+
+
+<font color="#157515">
+ The difference in detainess.per.1000 between the high and low literacy groups is 
+brought about by the gap between the different gender groups. It is similarly 
+influenced by the extreme values.Therefore, in the subsequent analysis, we will
+use detainess per 1000 after taking logs to eliminate the effect of extreme values.
+</font>
+
+<font color="#157515">
+ A final figure summarizes the results in the multivariate descriptive analysis,
+where the difference in detainee.per.1000 between literacy rates was not significant,
+but the detainees.per.1000 were more dispersed in the high literacy rate group. 
+An overall negative trend was observed.
+</font>
+
+#### Table on fallen data: bivariate and trivariate
+
+```{r}
+detainees %>%
+  group_by(`Region/State`) %>%
+  summarise(., n())
+```
+
+We would like to research the relation between the number of people detained per town and the number of people fallen per town.  
+
+ - First, summarize the number of detainees per town.
+```{r}
+detained.per.town <- detainees %>%
+  # delete the null value in `Township`
+    filter(!is.na(.$`Region/State`)) %>%
+  group_by(`Region/State`) %>%
+  count() %>%
+  mutate(detained.num = n) %>%
+  select(`Region/State`, detained.num)
+
+detained.per.town %>% head(5)
+```
+
+
+ - Second, summarize the number of fallens per town.
+```{r}
+fallen.per.town <- fallen %>%
+  # delete the null value in `Township`
+    filter(!is.na(.$`States/Regions`)) %>%
+  group_by(`States/Regions`) %>%
+  count() %>%
+  mutate(fallen.num = n) %>%
+  select(`States/Regions`, fallen.num)
+
+fallen.per.town %>% head(5)
+``` 
+
+We would like to briefly analyze the detainee and the fallen dataset.
+
+##### Table on fallen data: bivariate
+
+```{r}
+fallen %>% 
+  datasummary(data = ., Sex ~  Age * Mean)
+```
+
+##### Table on fallen data: trivariate
+
+```{r}
+fallen %>% 
+  datasummary(data = ., `States/Regions` ~ Sex * Age * Mean)
+```
+
+### Statistical Test
+
+```{r}
+fallen.2sex <- fallen %>%
+  filter(Sex != "LGBT")
+
+fallen.sex.t.test <- t.test(Age ~ Sex, data = fallen.2sex)
+fallen.sex.t.test
+```
+
+```{r}
+fallen.sex.t.test$p.value
+```
+
+According to the t test above, the p value is `r fallen.sex.t.test$p.value`, which is much larger than 0.05, so we could conclude that the age of fallen people do not have signifiant difference within male and female.
+
+### Data Summarizations on Merged Data
+As aboved steps show, we finally select some matrixes from both MIMU and ACLED dataset. Now, based on the data, we want to do some summarization and visualization. 
+```{r}
+merged.for.regression %>% head(5)
+str(merged.for.regression)
+summary(merged.for.regression)
+merged.for.regression %>%
+  datasummary_skim()
+```
+
+When we run regression, we don't want use missing data. So all the missing data would be dropped in the final model regression process.
+```{r}
+merged.data <- merged.for.regression %>%
+  filter(!is.na(conflicts.num))
+merged.data %>% head(5)
+merged.data %>%
+  datasummary_skim()
+```
+
+## MODELS AND ANALYSIS
+
+### Regression Model 1: regression on all variables
+#### Linear Regression Model:
+Now we run regression of detainees.per.1000 on all other variables, and analyze the results:
+
+```{r}
+options(scipen=4)
+lm.all.variables <- lm(data=merged.data,
+                       detainees.per.1000 ~ employee.num + poverty.ratio + 
+                         food.poverty.index + poverty.gap.ratio + 
+                         fem.literacy + male.literacy + 
+                         sex.ratio + conflicts.num)
+summary(lm.all.variables)
+```
+Before we analyze the result, we first get into the correlation of the independent variables and take the assessment for collinearity.
+
+#### Correlation analysis:
+```{r fig.align='center'}
+var.names <- c("employee.num", "poverty.ratio", "food.poverty.index", "poverty.gap.ratio", "fem.literacy", "male.literacy", "sex.ratio","conflicts.num")
+merged.data %>%
+  select(all_of(var.names)) %>%
+  pairs()
+```
+From the correlation figures above, we can find that there are strong correlations between `poverty.ratio`, `food.poverty.index` and `poverty.gap.ratio`. In addition, fem.literacy and male.literacy have strong correlations. Therefore, we should delete some variables to fine tune the model.
+
+### Regression Model 2: regression on selected variables
+#### Linear Regression Model:
+```{r}
+lm.all.variables.refined <- lm(data=merged.data,
+                               detainees.per.1000 ~ employee.num + food.poverty.index + 
+                                 sex.ratio + fem.literacy + conflicts.num)
+summary(lm.all.variables.refined)
+```
+#### Regression diagnostics analysis
+After getting the basic regression model, we would like to look at the diagnostic plots and access whether it is reasonable to use this model.
+```{r fig.align='center'}
+plot(lm.all.variables.refined, sub.caption = "Diagnostics Analysis")
+```
+
+Look at the four plots. 
+
+First of all, we expect **Residuals vs. Fitted** to have constant variance and consider residuals and fitted values uncorrelated. However, it seems like they are not uncorrelated.
+As for **Normal QQ plot**, it looks a little right-skewed, and the residuals from the regression are not normally distributed.
+
+In **Scale-location plot**  plot, there is no discernible trends.
+
+But in **Residuals vs Leverage** plot, it seems that there are some obvious outliers.
+
+Based on the diagnostics analysis, we assume there is a better version for this regression model. Considering the QQ plot, we expect to do log calculation on the dependent variable and do linear regression on `log(detainees.per.1000)`.
+
+### Regression Model 3: log calculation on dependent variable
+#### Linear Regression Model:
+```{r fig.align='center'}
+lm.all.variables.refined.log1 <- lm(data=merged.data,
+                               log(detainees.per.1000) ~ employee.num + food.poverty.index + 
+                                 fem.literacy + conflicts.num + sex.ratio)
+plot(lm.all.variables.refined.log1, sub.caption = "Diagnostics Analysis")
+summary(lm.all.variables.refined.log1)
+```
+
+Looking at the p-value of sex.ratio, its p-value is `r round(summary(lm.all.variables.refined.log1)$coef, 5)["sex.ratio", "Pr(>|t|)"]` and it is greater than 0.05. So it would be better if we dropped this column. 
+
+### Regression Model 4: use selected variables to regress on log(dependent variable)
+#### Linear Regression Model:
+Now drop the variable and rerun the regression.
+```{r}
+lm.all.variables.refined.log <- lm(data=merged.data,
+                               log(detainees.per.1000) ~ employee.num +
+                                 food.poverty.index + fem.literacy + conflicts.num)
+summary(lm.all.variables.refined.log)
+```
+#### Regression diagnostics analysis
+```{r fig.align='center'}
+plot(lm.all.variables.refined.log, sub.caption = "Diagnostics Analysis")
+```
+
+Now look at the four plots again. 
+
+**Residuals vs. Fitted**: It is obvious that residuals and fitted are unrelated with each other.
+
+**Normal QQ plot**, The residuals from the regression are almost normally distributed. It is more normal distributed than the previous model. 
+
+**Scale-location plot**, there is no discernible trends.
+
+**Residuals vs Leverage** , it seems that there are no apparent outliers.
+
+Therefore, based on the diagnostics analysis, we consider it is reasonable to use this model. Our final model is to run linear regression of `log(detainees.per.1000)` on `employee.num`, `food.poverty.index`, `fem.literacy` and `conflicts.num`.
+
+## RESULTS
+```{r}
+summary(lm.all.variables.refined.log)
+lm.coef <- round(summary(lm.all.variables.refined.log)$coef, 5)
+```
+From the summary report, we can see that based on the confidence leve of 95%, `employee.num`, `food.poverty.index`, `fem.literacy` and `conflicts.num` are all statistically significant predictors of `log(detainees.per.1000)`. The overall p-value is significantly less than 0.05.
+The p-value of `employee.num` is `r lm.coef["employee.num", "Pr(>|t|)"]`, the p-value of `food.poverty.index` is `r lm.coef["food.poverty.index", "Pr(>|t|)"]`, the p-value of `fem.literacy` is `r lm.coef["fem.literacy", "Pr(>|t|)"]`, the p-value of `conflicts.num` is `r lm.coef["conflicts.num", "Pr(>|t|)"]`. They are all smaller than `0.05`.
+
+When all else being equal between two townships, a 1 employment increase in average employee number appears to be associated with a `r lm.coef["employee.num", "Estimate"]` decrease in log(detainment rates per thousand). When all else being equal between two townships, a 1 food poverty increase in average appears to be associated with a `r lm.coef["food.poverty.index", "Estimate"]` increase in log(detainment rates per thousand). When all else being equal between two townships, a 1 fem.literacy increase in average appears to be associated with a `r lm.coef["fem.literacy", "Estimate"]` increase in log(detainment rates per thousand). When all else being equal between two townships, a 1 conflict number increase in average appears to be associated with a `r lm.coef["conflicts.num", "Estimate"]` increase in log(detainment rates per thousand).
+
+We can write the model as:
+$$
+log(detaineesPer1000) = \text-6.196 - \text0.00007 \times \text{employeeNum} + \text0.042 \times \text{povertyIndex} + \text0.028 \times \text{fem.literacy} + \text0.007 \times \text{conflictNum} 
+$$
+
+
+## DISCUSSIONS
+### Limitations of the Analysis
+Although we have 5 data sets, several columns have too many missing values. For example, almost detainees and imprisoned don't have a valid age number. Therefore, we have to give up some columns that may have useful information. 
+
+In addition, the ACLED data set has only valid data that are based on 2021. However, the data from MIMU data set don't have data on 2021. They only have data before 2020. What's worse, it has so many missing columns that we have to use data from different years for analysis. For example, when selecting variable, we used the Employee Number, Female Literacy that are from 2014, Poverty data that are from 2010, but conflicts number data that are from 2021. This too large time span may lead to some problems.
+
+Beside, when preprocessing data, we simply drop the missing value. It may have some other ways to make use of them like filling the missing value with average data. And we didn't pay too much attention on outliers, but it is quite reasonable because we will do log calculation on dependent variables. The outliers would disappear in that case.
+
+About the dependent variables, there are also some limitations. The value of `Female literacy as a percentage of total female population` is almost all greater than 90% and the variance is quite small. Although it is related to `the detainment rates per thousand`, it is possible that they don't have cause and effect relationship.
+
+### Inferences from Results
+From the model, we can see that the detainment rates per thousand is positively influenced by female literacy percentage, poverty index and conflict number. It is negatively influenced by employee number. 
+
+Therefore, the higher the employment number is, the less the detainees percentage will be. The less the female literacy percentage is, the less the detainees percentage will be. The less the poverty index is, the less the detainees percentage will be. The less the conflict numberis, the less the detainees percentage will be. 
+
+### Potential Stakeholders
+We can connect some background about the detainee event with our analysis. As it is said in the introduction of final project, the background is that the Burmese military staged a coup, toppling the quasi-democratic government and removing Aung San Suu Kyi, the civilian leader supported by the National League of Democracy. 
+
+The potential stakeholders can be the Burmese military, Burmese government, or some other international organizations who want to stabilize the situation and make detainee number reduce.
+
+### Contextualization and Policy 
+To calm down such an event, it is important that reduce the local conflicts number. It would be wiser if some policies about bans on conflicts are announced. What's more, government can try to develop the local economy, to relief the poverty. 
+
+### Conclusions 
+In summary, the detainment rates per thousand is positively related to poverty index, female literacy, conflict number and negatively related to employee number. The linear regression model can be shown like below.
+$$
+log(detaineesPer1000) = \text-6.196 - \text0.00007 \times \text{employeeNum} + \text0.042 \times \text{povertyIndex} + \text0.028 \times \text{fem.literacy} + \text0.007 \times \text{conflictNum} 
+$$
+
+### Future Directions
+For further analysis, we can gain more variables from these data sets instead of just 8 variables. When dealing with missing values, if there is only a few missing, we can use some method like average value to fill them. Also, we can pay more attention to the outliers in case of bad effects on the model. 
+
+
+
+
+
+
+
+
+
+
+
